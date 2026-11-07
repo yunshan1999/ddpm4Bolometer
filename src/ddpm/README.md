@@ -2,6 +2,43 @@
 
 Denoising Diffusion Probabilistic Model (DDPM) for denoising cryogenic bolometer pulse signals from the CUORE experiment.
 
+## Quick Start (current model: scale embedding + FiLM)
+
+Four steps. `M` is the data root, `D` the model directory.
+
+```bash
+M=/media/Disk_YIN/yunshancheng/cuore
+D=$M/my_new_model
+
+# 1. Clean training + test data (tri-exp pulses). Noise: $M/noise_v2/noise_total
+python3 -u scripts/generate_clean_shards.py --output_dir $M/clean_triexp \
+    --model triexp --tau_energy_scaling
+python3 -u scripts/generate_clean_shards.py --output_dir $M/clean_triexp/test \
+    --model triexp --tau_energy_scaling --n_shards 1 --base_seed 99999
+
+# 2. Train
+mkdir -p $D
+nohup stdbuf -oL python3 -u -m src.ddpm.train \
+    --clean_dir $M/clean_triexp --noise_dir $M/noise_v2/noise_total \
+    --output_dir $D --loss l2 --scale_emb --film --amp \
+    --epochs 100 --batch_size 32 --lr 2e-4 --num_workers 4 \
+    > $D/train.log 2>&1 &
+
+# 3. Denoise the test set
+python3 -u scripts/denoise_test_set.py --scale_emb --film \
+    --clean_h5 $M/clean_triexp/test/clean_000.h5 \
+    --noise_h5 $M/noise_v2/noise_total/test/noise_000.h5 \
+    --model_path $D/best_model.pt --output $D/denoised_test_000.h5
+
+# 4. Plots + metrics -> $D/qa_test/
+python3 -u scripts/plot_triexp_inference.py --denoised_h5 $D/denoised_test_000.h5
+```
+
+`--scale_emb --film` must be passed at training **and** at every inference step.
+Already have data? Skip step 1.
+
+Everything below is background and reference.
+
 ## Task
 
 CUORE measures rare nuclear decays using TeO2 bolometers operating at ~10 mK. Each detector channel records voltage pulses proportional to deposited energy, contaminated by thermal and electronic noise. This DDPM denoiser recovers clean pulse waveforms from noisy observations to improve energy resolution.
@@ -454,71 +491,11 @@ The inference QA plot has 4 columns per sample:
 3. **PSD**: Power spectral density comparing clean, noisy, and 10-shot denoised
 4. **Metrics**: Per-sample metrics table with all numeric results
 
-## Recipe: scale-conditioned model on tri-exp data (`ddpm_triexp_scale_film`)
+## Results: `ddpm_triexp_scale_film`
 
-End-to-end commands for the current reference model: `UNet1D` with
-`--scale_emb --film`, trained on the tri-exponential full-range dataset
-(1 keV–5.4 MeV, 30 % pileup, energy-dependent decay). Paths are the ones
-used on the analysis machine; set `M` to your data root.
+Commands: see Quick Start at the top. Resume to more epochs with `--resume $D/checkpoint_100.pt --epochs 200 --lr 1e-4`.
 
-```bash
-M=/media/Disk_YIN/yunshancheng/cuore
-D=$M/ddpm_triexp_scale_film
-
-# 1. Clean data: 10 x 10000 train windows + 1 x 10000 test windows
-python3 -u scripts/generate_clean_shards.py --output_dir $M/clean_triexp \
-    --model triexp --tau_energy_scaling
-python3 -u scripts/generate_clean_shards.py --output_dir $M/clean_triexp/test \
-    --model triexp --tau_energy_scaling --n_shards 1 --base_seed 99999
-# Noise: noise_v2/noise_total/{,test/} from scripts/generate_noise_shards.py
-
-# 2. Train (100 epochs, lr 2e-4, cosine)
-mkdir -p $D
-nohup stdbuf -oL python3 -u -m src.ddpm.train \
-    --clean_dir $M/clean_triexp --noise_dir $M/noise_v2/noise_total \
-    --output_dir $D --loss l2 --scale_emb --film --amp \
-    --epochs 100 --batch_size 32 --lr 2e-4 --num_workers 4 \
-    > $D/train.log 2>&1 &
-
-# 2b. Optional: resume to 200 epochs (fresh cosine from lr 1e-4).
-#     Keep a copy of the epoch-100 best model first; resume overwrites it.
-cp -n $D/best_model.pt $D/best_model_ep095.pt
-nohup stdbuf -oL python3 -u -m src.ddpm.train \
-    --clean_dir $M/clean_triexp --noise_dir $M/noise_v2/noise_total \
-    --output_dir $D --loss l2 --scale_emb --film --amp \
-    --epochs 200 --batch_size 32 --lr 1e-4 --num_workers 4 \
-    --save_every 10 --seed 42 --resume $D/checkpoint_100.pt \
-    > $D/train_resume.log 2>&1 &
-
-# 3. Denoise the paired test set (deterministic 1-shot DDPM)
-nohup stdbuf -oL python3 -u scripts/denoise_test_set.py \
-    --clean_h5 $M/clean_triexp/test/clean_000.h5 \
-    --noise_h5 $M/noise_v2/noise_total/test/noise_000.h5 \
-    --model_path $D/best_model_ep095.pt --output $D/denoised_test_000.h5 \
-    --scale_emb --film --batch_size 64 --seed 0 \
-    > $D/denoise_test.log 2>&1 &
-
-# 4. QA plots + metrics (CPU)
-python3 -u scripts/plot_triexp_inference.py \
-    --denoised_h5 $D/denoised_test_000.h5 --out_dir $D/qa_test
-
-# 5. Optional diagnostics
-python3 -u scripts/denoise_examples_multishot.py --scale_emb --film \
-    --denoised_h5 $D/denoised_test_000.h5 --M 10
-python3 -u scripts/compare_denoised_examples.py \
-    --h5_a $D/denoised_test_000.h5 --label_a ep95 \
-    --h5_b $D/denoised_test_000_ep190.h5 --label_b ep190 \
-    --out_prefix $D/qa_compare_ep95_ep190/examples
-python3 -u scripts/compare_samplers.py --scale_emb --film \
-    --denoised_h5 $D/denoised_test_000.h5 \
-    --models ep95=$D/best_model_ep095.pt ep190=$D/best_model_ep190.pt
-```
-
-Every inference / diagnostic command must pass the same `--scale_emb
---film` (and schedule flags, if non-default) as training.
-`src.ddpm.inference` also accepts them, for the generic QA and DDIM paths.
-
-### Results (test set, 10000 windows, 30.6 % pileup)
+Test set: 10000 windows, 30.6 % pileup.
 
 Deterministic 1-shot DDPM with the epoch-95 best model:
 
